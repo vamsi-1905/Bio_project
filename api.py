@@ -23,6 +23,7 @@ from itertools import product
 from typing import Optional
 from contextlib import asynccontextmanager
 
+import pandas as pd
 import torch
 import xgboost as xgb
 from fastapi import FastAPI, HTTPException
@@ -97,6 +98,12 @@ def biological_features(ref: str, alt: str, ref_seq: str) -> np.ndarray:
     return feats
 
 
+def named_dmatrix(feat: np.ndarray) -> xgb.DMatrix:
+    """Wrap feature vector in a DataFrame so XGBoost gets the expected feature names."""
+    n = len(feat)
+    cols = [f"f_{i}" for i in range(n)]
+    return xgb.DMatrix(pd.DataFrame(feat.reshape(1, -1), columns=cols))
+
 def apply_mutation(ref_window: str, center: int, ref: str, alt: str) -> str:
     return ref_window[:center] + alt + ref_window[center + len(ref):]
 
@@ -120,10 +127,10 @@ def build_feature_vector(ref: str, alt: str,
 
 # ── Pydantic request models ───────────────────────────────────────────────────
 class VariantRequest(BaseModel):
-    chrom    : str         = Field(..., example="1")
-    position : int         = Field(..., example=925952)
-    ref      : str         = Field(..., example="G")
-    alt      : str         = Field(..., example="A")
+    chrom    : str
+    position : int
+    ref      : str
+    alt      : str
     ref_seq  : Optional[str] = Field(None, description="Reference window sequence (recommended)")
     alt_seq  : Optional[str] = Field(None, description="Alt window sequence (auto-built if omitted)")
 
@@ -164,17 +171,47 @@ async def lifespan(app: FastAPI):
     # DNABERT-2
     if os.path.exists(DNABERT_PATH):
         try:
-            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            import torch.nn as nn
+            from transformers import AutoTokenizer, AutoConfig
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
             print(f"Loading DNABERT-2 from {DNABERT_NAME}...")
-            tokenizer = AutoTokenizer.from_pretrained(DNABERT_NAME, trust_remote_code=True)
-            dna_model = AutoModelForSequenceClassification.from_pretrained(
-                DNABERT_NAME, num_labels=2, trust_remote_code=True
-            ).to(DEVICE)
-            dna_model.load_state_dict(
-                torch.load(DNABERT_PATH, map_location=DEVICE)
-            )
+            tokenizer  = AutoTokenizer.from_pretrained(DNABERT_NAME, trust_remote_code=True)
+            # Patch: replace remote BertConfig with standard one in all cached modules
+            from transformers.models.bert.configuration_bert import BertConfig as _StdCfg
+            import sys as _sys
+            for _mn, _mod in list(_sys.modules.items()):
+                if "transformers_modules" in _mn and hasattr(_mod, "BertConfig"):
+                    _mod.BertConfig = _StdCfg
+            # Also pre-patch the config module before get_class_from_dynamic_module triggers its import
+            from pathlib import Path as _P
+            import importlib.util as _ilu
+            _cache = _P.home()/".cache"/"huggingface"/"modules"
+            for _cfg in (_cache).rglob("configuration_bert.py"):
+                _mname = ".".join(_cfg.with_suffix("").relative_to(_cache).parts)
+                if _mname not in _sys.modules:
+                    _sp = _ilu.spec_from_file_location(_mname, _cfg)
+                    _m  = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_m)
+                    _m.BertConfig = _StdCfg; _sys.modules[_mname] = _m
+                else:
+                    _sys.modules[_mname].BertConfig = _StdCfg
+            config     = AutoConfig.from_pretrained(DNABERT_NAME, trust_remote_code=True)
+            ModelClass = get_class_from_dynamic_module("modeling_bert.BertModel", DNABERT_NAME)
+            # Patch config_class on the loaded ModelClass so from_pretrained passes validation
+            ModelClass.config_class = _StdCfg
+            base       = ModelClass.from_pretrained(DNABERT_NAME, config=config, trust_remote_code=True)
+            class _Clf(nn.Module):
+                def __init__(self, b):
+                    super().__init__()
+                    self.base = b
+                    self.classifier = nn.Linear(b.config.hidden_size, 2)
+                def forward(self, input_ids, attention_mask):
+                    out = self.base(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = self.classifier(out.last_hidden_state[:, 0])
+                    return type("O", (), {"logits": logits})()
+            dna_model = _Clf(base).to(DEVICE)
+            dna_model.load_state_dict(torch.load(DNABERT_PATH, map_location=DEVICE))
             dna_model.eval()
-            models["dnabert"] = dna_model
+            models["dnabert"]   = dna_model
             models["tokenizer"] = tokenizer
             print(f"  DNABERT-2 ready on {DEVICE}.")
         except Exception as e:
@@ -220,21 +257,25 @@ async def predict_xgb(req: VariantRequest):
     t0 = time.perf_counter()
 
     feat = build_feature_vector(req.ref, req.alt, req.ref_seq, req.resolved_alt_seq())
-    dmat = xgb.DMatrix(feat.reshape(1, -1))
+    dmat = named_dmatrix(feat)
     prob = float(models["xgb"].predict(dmat)[0])
 
     latency = (time.perf_counter() - t0) * 1000
 
+    THRESHOLD = 0.15
+
+    print("DEBUG PROB:", prob)
+
     return PredictionResponse(
-        chrom       = req.chrom,
-        position    = req.position,
-        ref         = req.ref,
-        alt         = req.alt,
-        model       = "XGBoost",
-        probability = round(prob, 6),
-        prediction  = "Pathogenic" if prob >= 0.5 else "Benign",
-        confidence  = _confidence(prob),
-        latency_ms  = round(latency, 2),
+       chrom = req.chrom,
+       position = req.position,
+       ref = req.ref,
+       alt = req.alt,
+       model = "XGBoost",
+       probability = round(prob, 6),
+       prediction = "Pathogenic" if prob >= THRESHOLD else "Benign",
+       confidence = _confidence(prob),
+       latency_ms = round(latency, 2),
     )
 
 
@@ -289,7 +330,7 @@ async def predict_ensemble(req: VariantRequest):
 
     if xgb_available:
         feat = build_feature_vector(req.ref, req.alt, req.ref_seq, req.resolved_alt_seq())
-        dmat = xgb.DMatrix(feat.reshape(1, -1))
+        dmat = named_dmatrix(feat)
         probs.append(float(models["xgb"].predict(dmat)[0]))
         weights.append(ENSEMBLE_XGB_W)
 
