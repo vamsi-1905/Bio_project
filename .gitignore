@@ -1,0 +1,16 @@
+
+
+venv/
+*.pt
+__pycache__/
+
+# Bioinformatics data files (The "Big" stuff)
+*.vcf
+*.fasta
+*.parquet
+*.csv
+*.dn... (that Homo_sapiens file)
+*.png
+*.json
+*.fa
+*.fasta
