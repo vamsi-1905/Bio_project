@@ -1,0 +1,17 @@
+
+
+venv/
+*.pt
+__pycache__/
+frontend/
+
+
+*.vcf
+*.fasta
+*.parquet
+*.csv
+*.dn... (that Homo_sapiens file)
+*.png
+*.json
+*.fa
+*.fasta
